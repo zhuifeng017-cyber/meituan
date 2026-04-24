@@ -1,22 +1,18 @@
 """
-WeChat Video Channel (视频号) Scraper
-Channel: sphflCd4Tm6wLvR
-Fields : title, description, views, likes, comments, shares, favorites
+WeChat Video Channel (视频号) Scraper — requests 版
+Channel : sphflCd4Tm6wLvR
+Fields  : title, description, views, likes, comments, shares, favorites
 
-─── 获取 Cookie 的方法 ────────────────────────────────────────────────────────
-方法 A（推荐）：Cookie 字符串文件
-  1. Charles 左侧点 channels.weixin.qq.com → 展开任意请求
-  2. 右侧 Headers 标签 → 找到 Cookie 行 → 右键复制整行值
-  3. 新建 cookies.txt，把复制的内容粘贴进去保存
+── 获取 Cookie（只需一次）──────────────────────────────────────────────────────
+1. 用 Chrome 打开 https://channels.weixin.qq.com/web/pages/home
+2. 手机微信扫码登录，进入主页
+3. 按 F12 → Console 标签 → 粘贴下面这行代码回车：
+       copy(document.cookie)
+4. 新建 cookies.txt，Ctrl+V 粘贴，保存
+5. 运行本脚本：python scraper.py
 
-方法 B：Charles 导出 HAR
-  File → Export Session → 选 HTTP Archive (.har) → 保存为 channels.har
-
-方法 C：直接写在脚本里（COOKIES_RAW 变量）
-
-─── 运行 ─────────────────────────────────────────────────────────────────────
-  pip install requests
-  python scraper.py
+Cookie 有效期约 7 天，过期后重复第 1-4 步即可。
+───────────────────────────────────────────────────────────────────────────────
 """
 
 import csv
@@ -24,7 +20,7 @@ import json
 import logging
 import os
 import time
-from http.cookiejar import CookieJar
+from pathlib import Path
 from urllib.parse import unquote
 
 import requests
@@ -32,41 +28,12 @@ import requests
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── 配置区 ─────────────────────────────────────────────────────────────────────
+# ── 配置 ───────────────────────────────────────────────────────────────────────
 
 FINDER_USERNAME = "sphflCd4Tm6wLvR"
 TARGET_COUNT    = 200
-PAGE_SIZE       = 10     # 每次请求条数（接口上限 10）
-REQUEST_DELAY   = 1.5    # 请求间隔秒数
-
-# 方法 C：直接粘贴完整 Cookie 字符串（从 Charles 复制）
-# 例如: COOKIES_RAW = "uin=o123456; skey=@abc; wxuin=123456; ..."
-COOKIES_RAW: str = ""
-
-# ── 常量 ──────────────────────────────────────────────────────────────────────
-
-API_URL = "https://channels.weixin.qq.com/cgi-bin/mmfindertrip/finder/profile/getpage"
-
-HEADERS = {
-    # 与 Charles 抓包一致的 UA（Windows WeChat 客户端内置浏览器）
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/129.0.6668.101 Safari/537.36 "
-        "Language/zh ColorScheme/Light wxwork/5.0.7 (MicroMessenger/6.2) "
-        "WindowsWechat"
-    ),
-    "Referer":        "https://channels.weixin.qq.com/",
-    "Origin":         "https://channels.weixin.qq.com",
-    "Content-Type":   "application/json",
-    "Accept":         "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "sec-ch-ua":       '"Chromium";v="129", "Not=A?Brand";v="8"',
-    "sec-ch-ua-mobile":   "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Site":  "same-origin",
-    "Sec-Fetch-Mode":  "cors",
-    "Sec-Fetch-Dest":  "empty",
-}
+PAGE_SIZE       = 10
+REQUEST_DELAY   = 1.5     # 翻页间隔（秒），不要调太小
 
 OUTPUT_JSON = "videos.json"
 OUTPUT_CSV  = "videos.csv"
@@ -76,72 +43,71 @@ CSV_FIELDS  = [
     "create_time", "video_url",
 ]
 
+API_URL = "https://channels.weixin.qq.com/cgi-bin/mmfindertrip/finder/profile/getpage"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer":         "https://channels.weixin.qq.com/",
+    "Origin":          "https://channels.weixin.qq.com",
+    "Content-Type":    "application/json",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
 
 # ── Cookie 加载 ────────────────────────────────────────────────────────────────
 
-def _parse_cookie_string(raw: str) -> dict[str, str]:
+def _parse_cookie_str(raw: str) -> dict[str, str]:
     """把 'k1=v1; k2=v2' 解析为字典。"""
-    cookies: dict[str, str] = {}
+    result: dict[str, str] = {}
     for part in raw.split(";"):
         part = part.strip()
         if "=" in part:
             k, _, v = part.partition("=")
-            cookies[k.strip()] = unquote(v.strip())
-    return cookies
-
-
-def _load_from_txt(path: str) -> dict[str, str]:
-    with open(path, encoding="utf-8") as f:
-        return _parse_cookie_string(f.read().strip())
-
-
-def _load_from_har(path: str) -> dict[str, str]:
-    """从 Charles 导出的 HAR 文件中提取 channels.weixin.qq.com 的 Cookie。"""
-    with open(path, encoding="utf-8") as f:
-        har = json.load(f)
-    entries = har.get("log", {}).get("entries", [])
-    for entry in entries:
-        url = entry.get("request", {}).get("url", "")
-        if "channels.weixin.qq.com" not in url:
-            continue
-        headers = entry.get("request", {}).get("headers", [])
-        for h in headers:
-            if h.get("name", "").lower() == "cookie":
-                cookies = _parse_cookie_string(h["value"])
-                if cookies:
-                    logger.info("从 HAR 文件提取到 %d 个 Cookie", len(cookies))
-                    return cookies
-    return {}
+            result[k.strip()] = unquote(v.strip())
+    return result
 
 
 def load_cookies() -> dict[str, str]:
-    # 优先级: cookies.txt > channels.har > COOKIES_RAW
-    if os.path.exists("cookies.txt"):
-        cookies = _load_from_txt("cookies.txt")
-        logger.info("从 cookies.txt 加载了 %d 个 Cookie", len(cookies))
-        return cookies
+    cookie_file = Path("cookies.txt")
+    if not cookie_file.exists():
+        logger.error(
+            "\n找不到 cookies.txt，请按以下步骤操作：\n"
+            "  1. 用 Chrome 打开 https://channels.weixin.qq.com/web/pages/home\n"
+            "  2. 手机微信扫码登录\n"
+            "  3. F12 → Console → 输入 copy(document.cookie) 回车\n"
+            "  4. 新建 cookies.txt，粘贴内容，保存\n"
+            "  5. 重新运行 python scraper.py\n"
+        )
+        raise SystemExit(1)
 
-    if os.path.exists("channels.har"):
-        cookies = _load_from_har("channels.har")
-        if cookies:
-            return cookies
-        logger.warning("channels.har 中未找到 channels.weixin.qq.com 的 Cookie")
+    raw = cookie_file.read_text(encoding="utf-8").strip()
+    if not raw:
+        logger.error("cookies.txt 是空的，请重新按上述步骤获取 Cookie。")
+        raise SystemExit(1)
 
-    if COOKIES_RAW.strip():
-        cookies = _parse_cookie_string(COOKIES_RAW)
-        logger.info("从 COOKIES_RAW 加载了 %d 个 Cookie", len(cookies))
-        return cookies
+    cookies = _parse_cookie_str(raw)
+    auth = [k for k in cookies if k in ("uin", "wxuin", "skey", "webex_data", "mmid")]
+    if not auth:
+        logger.warning(
+            "cookies.txt 中未找到微信登录态 Cookie（uin/skey 等）。\n"
+            "请确认已在 channels.weixin.qq.com 登录后再复制 Cookie。\n"
+            "当前读取到的键：%s", list(cookies.keys())
+        )
+    else:
+        logger.info("Cookie 加载成功，登录态键：%s", auth)
 
-    return {}
+    return cookies
 
-
-# ── API 调用 ───────────────────────────────────────────────────────────────────
+# ── 数据解析 ───────────────────────────────────────────────────────────────────
 
 def _parse_video(obj: dict, index: int) -> dict:
     desc       = obj.get("objectDesc", {})
     media_list = desc.get("media", [{}])
     media      = media_list[0] if media_list else {}
-
     return {
         "index":       index,
         "video_id":    obj.get("objectId", ""),
@@ -156,8 +122,9 @@ def _parse_video(obj: dict, index: int) -> dict:
         "video_url":   media.get("url", ""),
     }
 
+# ── 采集 ────────────────────────────────────────────────────────────────────────
 
-def fetch_page(session: requests.Session, last_buffer: str) -> tuple[list[dict], str, bool]:
+def fetch_page(session: requests.Session, last_buffer: str) -> tuple[list, str, bool]:
     payload = {
         "finderUsername": FINDER_USERNAME,
         "count":          PAGE_SIZE,
@@ -167,10 +134,17 @@ def fetch_page(session: requests.Session, last_buffer: str) -> tuple[list[dict],
     resp.raise_for_status()
     body = resp.json()
 
-    ret_code = body.get("base_resp", {}).get("ret", -1)
-    if ret_code != 0:
+    ret = body.get("base_resp", {}).get("ret", -1)
+    if ret != 0:
         err = body.get("base_resp", {}).get("err_msg", "")
-        raise RuntimeError(f"API ret={ret_code}: {err}")
+        # ret=200013 表示登录态失效
+        if ret == 200013:
+            raise RuntimeError(
+                f"Cookie 已过期（ret={ret}）。\n"
+                "  请重新在 Chrome 登录 channels.weixin.qq.com，\n"
+                "  再执行 copy(document.cookie) 更新 cookies.txt。"
+            )
+        raise RuntimeError(f"API 错误 ret={ret}: {err}  响应：{body}")
 
     data     = body.get("data", {})
     objects  = data.get("object", [])
@@ -179,39 +153,28 @@ def fetch_page(session: requests.Session, last_buffer: str) -> tuple[list[dict],
     return objects, next_buf, has_more
 
 
-# ── 主流程 ─────────────────────────────────────────────────────────────────────
-
 def scrape() -> list[dict]:
     cookies = load_cookies()
-    if not cookies:
-        logger.error(
-            "\n未找到 Cookie，请选择以下任一方式提供：\n"
-            "  A. 在 Charles 里找 channels.weixin.qq.com 的请求 → 复制 Cookie 值 → 存入 cookies.txt\n"
-            "  B. Charles → File → Export Session → 保存为 channels.har\n"
-            "  C. 直接把 Cookie 字符串粘贴到脚本中 COOKIES_RAW 变量\n"
-        )
-        raise SystemExit(1)
-
     session = requests.Session()
     session.cookies.update(cookies)
 
     videos: list[dict] = []
     last_buffer = ""
 
-    logger.info("开始采集视频号 %s（目标 %d 条）", FINDER_USERNAME, TARGET_COUNT)
+    logger.info("开始采集视频号 %s（目标 %d 条）…", FINDER_USERNAME, TARGET_COUNT)
 
     while len(videos) < TARGET_COUNT:
         try:
             objects, last_buffer, has_more = fetch_page(session, last_buffer)
-        except requests.HTTPError as e:
-            logger.error("HTTP 错误: %s", e)
-            break
         except RuntimeError as e:
-            logger.error("接口错误: %s", e)
+            logger.error("%s", e)
+            break
+        except requests.HTTPError as e:
+            logger.error("HTTP 错误：%s", e)
             break
 
         if not objects:
-            logger.info("接口返回空列表，采集结束。")
+            logger.info("已无更多数据。")
             break
 
         for obj in objects:
@@ -221,31 +184,32 @@ def scrape() -> list[dict]:
 
         logger.info("已采集 %d / %d 条", len(videos), TARGET_COUNT)
 
-        if not has_more:
-            logger.info("已到达最后一页。")
+        if not has_more or not last_buffer:
+            logger.info("已到最后一页。")
             break
 
         time.sleep(REQUEST_DELAY)
 
     return videos
 
+# ── 保存 ────────────────────────────────────────────────────────────────────────
 
 def save(videos: list[dict]) -> None:
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
         json.dump(videos, f, ensure_ascii=False, indent=2)
-    logger.info("JSON 已保存 → %s", OUTPUT_JSON)
+    logger.info("JSON → %s", OUTPUT_JSON)
 
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(videos)
-    logger.info("CSV  已保存 → %s（可直接用 Excel 打开）", OUTPUT_CSV)
+    logger.info("CSV  → %s（可直接用 Excel 打开）", OUTPUT_CSV)
 
 
 if __name__ == "__main__":
     results = scrape()
     if results:
         save(results)
-        logger.info("完成，共采集 %d 条视频数据。", len(results))
+        logger.info("完成，共采集 %d 条。", len(results))
     else:
         logger.warning("未采集到任何数据。")
